@@ -1,0 +1,232 @@
+---
+title: "Machine Learning Prediction Assignment"
+author: "Stephen Auyeung"
+date: "March 25, 2016"
+output: html_document
+---
+
+## Introduction
+
+This report uses open sourced research data collected by GroupwareLES, more on [their work here](http://groupware.les.inf.puc-rio.br/har). The data includes movement readings  from wearable sensors that tracked body movement as test subjects performed bicep curls.  The prediction goal is to correctly identify the class of movement study participants perfomed the exercise based on observation readings from each sensor.  This value is captured in the 'classe' variable.
+
+The first step to building the proper prediction model is to load and partition our dataset into training, validation and testing subsets.  Additionally, a 1000 row subset of data, labeled 'small_train', is created in order to improve computing time while prototype different models.
+
+```{r load_pml_data, message = F, warning = F, cache=TRUE, include=FALSE}
+setwd("~/Projects/data specialization/machine learning")
+library(caret)
+raw_test <- read.csv("pml-testing.csv")
+raw_train <- read.csv("pml-training.csv")
+```
+
+``` {r partition_data_1, dependson="load_pml_data", cache=TRUE}
+set.seed(123)
+inTrain <- createDataPartition(y=raw_train$classe, p=0.7, list=FALSE)
+training <- raw_train[inTrain,]; testing <- raw_train[-inTrain,];
+```
+
+``` {r partition_data_2, dependson="partition_data_1", cache=TRUE}
+set.seed(123)
+inTrain2 <- createDataPartition(y=training$classe, p=0.6, list=FALSE)
+train_2 <- training[inTrain2,]; train_2_validation <- training[-inTrain2,];
+# Function to help sample across classe factor
+rndid <- with(training, ave(X, classe, FUN=function(x) {sample.int(length(x))}))
+small_train <- training[rndid<=200,]
+```
+
+## Exploratory analysis of data set
+
+Even after subsetting the data into smaller training and validation sets, each set still has 160 predictors. By summarizing the column values, a few patterns appear.  
+
+First, we find that many of the predictors have NA data across most of the observations.  This relates to the way the data was collected, as multiple sensor readings were collected through each movement, while summary data is aggregated only on the new window of a particular movement.  Because these summary metrics aren't consistent across all observations, and the goal is to predict the movement class based on single observations, we can safely remove predictor variables that summarize movement information.
+
+The remaining predictor variables can be broken up by time series predictors, and individual sensor readings. We used the two functions below to segment our training sets into groups to sets with only sensor and timeseries readings before running our model fits.
+
+```{r column_names, dependson="partition_data_1", include=FALSE, cache=TRUE}
+max_names <- grep("max", names(training), value=T)
+min_names <- grep("min", names(training), value=T)
+timestamp_names <- grep("timestamp", names(training), value=T)
+window_names <- grep("window", names(training), value=T)
+kurtosis_names <- grep("kurtosis", names(training), value=T)
+skewness_names <- grep("skewness", names(training), value=T)
+amplitude_names <- grep("amplitude", names(training), value=T)
+var_names <- grep("var_", names(training), value=T)
+stddev_names <- grep("stddev", names(training), value=T)
+avg_names <- grep("avg_", names(training), value=T)
+non_sensor_columns <- c("X", "user_name",
+                        max_names, min_names, 
+                        timestamp_names, window_names,
+                        kurtosis_names, skewness_names, 
+                        amplitude_names, var_names, 
+                        stddev_names, avg_names)
+non_ts_sensor_columns <- c(max_names, min_names, 
+                           kurtosis_names, skewness_names, 
+                           amplitude_names, var_names, 
+                           stddev_names, avg_names)
+```
+
+```{r subset_fcns, dependson="column_names", cache=TRUE}
+subset_sensor_columns <- function(dataframe) {
+    sensor_columns <- setdiff(names(dataframe), non_sensor_columns)
+    return(dataframe[,sensor_columns])
+}
+
+subset_ts_sensor_columns <- function(dataframe) {
+    ts_obs_columns <- setdiff(names(dataframe), non_ts_sensor_columns)    
+    return(dataframe[,ts_obs_columns])
+}
+```
+
+```{r numeric_conversion, dependson="subset_fcns", cache=TRUE, include=FALSE}
+convert_variables_to_numeric <- function(dataframe) {
+    n <- length(dataframe) - 1
+    for(i in 1:n) {
+        dataframe[,i] <- as.numeric(dataframe[,i])
+    }
+    return(dataframe)
+}
+
+sensor_train <- subset_sensor_columns(train_2)
+num_sensor_data <- convert_variables_to_numeric(sensor_train[,c(-53)])
+```
+
+Another interesting feature of the data is the number of highly correlated variables.  Creating a correlation table for the variables, we find 60 cases where there is 80% or higher correlation with another variable.  This suggests principle component analysis could might be helpful as a preprocessing technique.
+
+```{r predictor_correlation, dependson="numeric_conversion"}
+M <- abs(cor(num_sensor_data))
+diag(M) <- 0
+length(which(M > 0.8,arr.ind=T))
+```
+
+## Model selection process
+
+After creating subsets based on types of predictors, a series of prototype models were applied to a subset of sensor only readings, and a subset of readings that include sensor and timeseries data.  The models run were: classification tree, random forest, random forest with principle component analysis, and a generalized boosting model.
+
+### Prototyping using small training dataset
+
+All of the models were first run on the training set 'small_train', which only includes 1000 observations.  
+
+```{r set_small_train_data, dependson=c("partition_data_2", "subset_fcns"), include=FALSE}
+smallT_sensor_columns <- subset_sensor_columns(small_train)
+smallT_ts_sensor_columns <- subset_ts_sensor_columns(small_train)
+```
+
+```{r rpart_prototype, dependson="set_small_train_data", message = F, warning = F, cache=TRUE, include=FALSE}
+modFitTree1 <- train(classe~., data=smallT_sensor_columns, method="rpart")
+predTree1 <- predict(modFitTree1, train_2_validation)
+```
+
+```{r rpart_prototype_2, dependson="set_small_train_data", message = F, warning = F, cache=TRUE, include=FALSE}
+modFitTree2 <- train(classe~., data=smallT_ts_sensor_columns, method="rpart")
+predTree2 <- predict(modFitTree2, train_2_validation)
+```
+
+```{r rf_prototype, dependson="set_small_train_data", message = F, warning = F, cache=TRUE, include=FALSE}
+modFitRF1 <- train(classe~., data=smallT_sensor_columns, method="rf")
+predRF1 <- predict(modFitRF1, newdata=train_2_validation)
+```
+
+```{r rf_prototype_2, dependson="set_small_train_data", message = F, warning = F, cache=TRUE, include=FALSE}
+modFitRF2 <- train(classe~., data=smallT_sensor_columns, method="rf", preProcess="pca")
+predRF2 <- predict(modFitRF2, newdata=train_2_validation)
+```
+
+```{r rf_prototype_3, dependson="set_small_train_data", message = F, warning = F, cache=TRUE, include=FALSE}
+modFitRF3 <- train(classe~., data=smallT_ts_sensor_columns, method="rf")
+predRF3 <- predict(modFitRF3, newdata=train_2_validation)
+```
+
+```{r boo_prototype, dependson="set_small_train_data", message = F, warning = F, cache=TRUE, include=FALSE}
+modFitBoo1 <- train(classe~., data=smallT_sensor_columns, method="gbm") # start 5:50 end 6:05
+predBoo1 <- predict(modFitBoo1, newdata=train_2_validation)
+```
+
+```{r boo_prototype_2, dependson="set_small_train_data", message = F, warning = F, cache=TRUE, include=FALSE}
+modFitBoo2 <- train(classe~., data=smallT_ts_sensor_columns, method="gbm")
+predBoo2 <- predict(modFitBoo2, newdata=train_2_validation)
+```
+
+The following table shows the accuracy measures from these models used to predict the validation set, 'train_2_validation'.  Interestingly, principle component analysis resulted in lower accuracy.  The prototype model results also show the timeseries predictors appear to have a strong effect on model accuracy.
+
+```{r accuracy_table, dependson=c(-1:-7), message = F, warning = F, cache=TRUE, echo=FALSE}
+model <- c("tree", "tree", "random forest", "random forest w/ pca", "random forest", "boosting", "boosting")
+dataset <- c("sensor", "sensor+ts", "sensor", "sensor", "sensor+ts", "sensor", "sensor+ts")
+accuracy <- c(confusionMatrix(predTree1, train_2_validation$classe)$overall[1], 
+             confusionMatrix(predTree2, train_2_validation$classe)$overall[1],
+             confusionMatrix(predRF1, train_2_validation$classe)$overall[1],
+             confusionMatrix(predRF2, train_2_validation$classe)$overall[1],
+             confusionMatrix(predRF3, train_2_validation$classe)$overall[1],
+             confusionMatrix(predBoo1, train_2_validation$classe)$overall[1],
+             confusionMatrix(predBoo2, train_2_validation$classe)$overall[1])
+
+accuracy_table <- data.frame(Model = model, Dataset = dataset, Accuracy = accuracy)
+accuracy_table[order(accuracy_table[,2], -accuracy_table[,3]),]
+```
+
+## Cross validation technique
+
+With the benchmark results from earlier prototype models, we are able to strengthen these models by training them on a large dataset.  In this case the 'train_2' data.  Only the strongest performing models were trained using the larger dataset, resulting in further accuracy improvements.
+
+```{r set_train2_data, dependson=c("partition_data_2", "subset_fcns"), include=FALSE}
+train2_sensor_columns <- subset_sensor_columns(train_2)
+train2_ts_sensor_columns <- subset_ts_sensor_columns(train_2)
+```
+
+```{r train2_models, dependson=c("rpart_prototype_2", "set_train2_data"), message = F, warning = F, cache=TRUE, echo=FALSE, include=FALSE}
+mf_rf_ts <- train(classe~., data=train2_ts_sensor_columns, method="rf")
+pred_rf_ts <- predict(mf_rf_ts, newdata=train_2_validation)
+
+mf_rf_sensor <- train(classe~., data=train2_sensor_columns, method="rf")
+pred_rf_sensor <- predict(mf_rf_sensor, newdata=train_2_validation)
+
+mf_boost_ts <- train(classe~., data=train2_ts_sensor_columns, method="gbm")
+pred_boost_ts <- predict(mf_boost_ts, newdata=train_2_validation)
+
+mf_boost_sensor <- train(classe~., data=train2_sensor_columns, method="gbm")
+pred_boost_sensor <- predict(mf_boost_sensor, newdata=train_2_validation)
+```
+
+```{r accuracy_table_2, dependson=c(-1, -2), message = F, warning = F, cache=TRUE, echo=FALSE}
+model <- c("random forest", "random forest", "boosting", "boosting")
+dataset <- c("sensor+ts", "sensor", "sensor+ts", "sensor")
+accuracy <- c(confusionMatrix(pred_rf_ts, train_2_validation$classe)$overall[1], 
+             confusionMatrix(pred_rf_sensor, train_2_validation$classe)$overall[1],
+             confusionMatrix(pred_boost_ts, train_2_validation$classe)$overall[1],
+             confusionMatrix(pred_boost_sensor, train_2_validation$classe)$overall[1])
+
+accuracy_table_2 <- data.frame(Model = model, Dataset = dataset, Accuracy = accuracy)
+accuracy_table_2[order(accuracy_table_2[,2], -accuracy_table_2[,3]),]
+```
+
+Although models built using timeseries data have higher accuracy on the validation set, the models only predict one class when applied to the 20 test observations.  This suggests a quirk in the model which may not make it applicable to data with new timeseries periods.  As a result, we only move forward with two final prediction models.
+
+```{r prediction_tables, dependson=c(-2), message = F, warning = F, cache=TRUE, echo=FALSE}
+rf_ts_test <- table(predict(mf_rf_ts, newdata=raw_test))
+rf_sensor_test <- table(predict(mf_rf_sensor, newdata=raw_test))
+boost_ts_test <- table(predict(mf_boost_ts, newdata=raw_test))
+boost_sensor_test <- table(predict(mf_boost_sensor, newdata=raw_test))
+test_pred_table <- rbind(rf_ts_test, rf_sensor_test, boost_ts_test, boost_sensor_test)
+model_names <- c("random forest", "random forest", "boosting", "boosting")
+time_series <- c(TRUE, FALSE, TRUE, FALSE)
+test_pred_table <- cbind("Model"=model_names, "Timeseries?"=time_series, test_pred_table)
+test_pred_table
+```
+
+## Estimated out of sample error
+
+The out of sample error estimate was calculated by running the final models on hold out data that was not used in the model creation.  This was accomplished by predicting on the 'testing' subset of data.  Accuracy results in the table below show reduced accuracy on the holdout data, but the reduction is rather small.
+
+```{r test_accuracy, dependson=c("partition_data_1", "train2_models"), message = F, warning = F, cache=TRUE, echo=FALSE}
+rf_predictions <- predict(mf_rf_sensor, newdata=testing)
+boost_predictions <- predict(mf_boost_sensor, newdata=testing)
+
+model <- c("random forest", "boosting")
+accuracy <- c(confusionMatrix(rf_predictions, testing$classe)$overall[1], 
+             confusionMatrix(boost_predictions, testing$classe)$overall[1])
+
+accuracy_table_3 <- data.frame(Model = model, Accuracy = accuracy)
+accuracy_table_3
+```
+
+## Conclusion
+
+The random forest model applied to sensor only data has the strongest prediction accuracy, at 98.7%.  However, the random forest model is not very efficient in calculating the model fit.  In this case, the boosting model, with accuracy of 95.6% might also be considered.  Either way, we are able to build rather strong prediction models from this data.
